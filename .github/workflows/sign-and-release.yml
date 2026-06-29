@@ -1,0 +1,129 @@
+name: sign-and-release
+
+# Triggered by pushing a semver tag (e.g. v1.0.0). Compiles the Windows
+# recovery PowerShell to a .exe via ps2exe, signs it through SignPath.io's
+# free OSS tier, then publishes the signed .exe plus the raw .ps1 / .sh
+# sources as a GitHub Release.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # create the GitHub Release
+  id-token: write   # SignPath uses OIDC to bind the submission to this run
+
+jobs:
+  build-sign-release:
+    runs-on: windows-latest
+    env:
+      PS2EXE_VERSION: '1.0.15'
+      ARTIFACT_NAME: recover-workspaces-windows
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ps2exe wants a 4-part numeric file version (Win32 VERSIONINFO).
+      # Pad v1.2.3 -> 1.2.3.0 so the compile doesn't fail at the last step.
+      - name: Resolve version from tag
+        id: ver
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $v = $tag.TrimStart('v')
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          if ($v -notmatch '^\d+\.\d+\.\d+(\.\d+)?$') { $v = "$v.0" }
+          if (($v.Split('.')).Count -lt 4) { $v = "$v.0" }
+          "fileversion=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "tag=$tag fileversion=$v"
+
+      - name: Install ps2exe (pinned)
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module -Name ps2exe -RequiredVersion $env:PS2EXE_VERSION -Scope CurrentUser -Force
+
+      # Populating -title / -description / -company / -product /
+      # -copyright / -version writes a complete Win32 VERSIONINFO block.
+      # Both SmartScreen and Defender penalise blank metadata. We do NOT
+      # pass -noConsole (a hidden window looks like malware for a recovery
+      # tool — keep the user able to see "[FAIL] <msg>"). We do NOT pass
+      # -requireAdmin (the script writes only to the user's own AppData
+      # / .config, no UAC needed; requiring admin would itself look
+      # suspicious).
+      - name: Compile ps1 -> exe
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path build -Force | Out-Null
+          Invoke-ps2exe `
+            -inputFile  scripts/recover-workspaces-windows.ps1 `
+            -outputFile build/${{ env.ARTIFACT_NAME }}.exe `
+            -title       'Nexforce Workspace Recovery' `
+            -description 'Recovers Nexforce Work workspaces on Windows' `
+            -company     'Nexforce' `
+            -product     'Nexforce Work Signed Scripts' `
+            -copyright   '(c) Nexforce' `
+            -version     '${{ steps.ver.outputs.fileversion }}' `
+            -DPIAware `
+            -supportOS
+
+      - name: Upload unsigned exe for SignPath
+        id: upload-unsigned
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-exe
+          path: build/${{ env.ARTIFACT_NAME }}.exe
+          if-no-files-found: error
+
+      # SignPath OSS tier requires a reviewer approval per submission.
+      # `wait-for-completion: true` parks this step until SignPath either
+      # signs and returns the artifact or the timeout expires. 10h covers
+      # the documented OSS reviewer SLA with margin. If approval doesn't
+      # land in time, re-run the workflow against the same tag (no source
+      # changes needed).
+      - name: Submit to SignPath and wait for signed artifact
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: nexforce-work-scripts-pool
+          signing-policy-slug: release-signing
+          artifact-configuration-slug: initial
+          github-artifact-id: ${{ steps.upload-unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 36000
+          service-unavailable-timeout-in-seconds: 600
+          output-artifact-directory: build/signed
+
+      - name: Stage release assets
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path release -Force | Out-Null
+          Copy-Item build/signed/${{ env.ARTIFACT_NAME }}.exe release/
+          Copy-Item scripts/recover-workspaces-windows.ps1     release/
+          Copy-Item scripts/recover-workspaces-macos.sh        release/
+          Copy-Item scripts/recover-workspaces-linux.sh        release/
+          Copy-Item scripts/install-nexforce-work-windows.ps1  release/
+          Copy-Item scripts/install-nexforce-work-macos.sh     release/
+          Copy-Item scripts/install-nexforce-work-linux.sh     release/
+          # SHA256SUMS.txt — the README points users here to verify
+          # downloads without trusting GitHub-side tampering.
+          Get-FileHash release/* -Algorithm SHA256 |
+            ForEach-Object { "{0}  {1}" -f $_.Hash, (Split-Path $_.Path -Leaf) } |
+            Set-Content release/SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            release/${{ env.ARTIFACT_NAME }}.exe
+            release/recover-workspaces-windows.ps1
+            release/recover-workspaces-macos.sh
+            release/recover-workspaces-linux.sh
+            release/install-nexforce-work-windows.ps1
+            release/install-nexforce-work-macos.sh
+            release/install-nexforce-work-linux.sh
+            release/SHA256SUMS.txt
