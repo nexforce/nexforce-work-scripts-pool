@@ -2,7 +2,7 @@
 
 Last Modified: 2026-06-30.
 
-This policy applies specifically to the **Nexforce Work Scripts Pool** — the install + recovery scripts published in this repository (and the signed `.exe` derivatives served from its GitHub Releases). It does **not** restate the full Nexforce Global Corp. privacy policy that governs the broader Nexforce / Nexbot products; for that, see <https://nexforce.co> or contact `product@nexforce.co`.
+This policy applies specifically to the **Nexforce Work Scripts Pool** — the install + recovery scripts published in this repository (and the signed `.exe` derivatives served from its GitHub Releases). It does **not** restate the full Nexforce Global Corp. privacy policy that governs the broader Nexforce products; for that, see <https://nexforce.co> or contact `product@nexforce.co`.
 
 Your data privacy is of utmost importance to us. This policy details: the data we accumulate and the reasons behind it; the manner in which your data is managed; and the privileges you possess regarding your data.
 
