@@ -43,7 +43,7 @@ If Windows Defender flags the signed `.exe` (it shouldn't, post-signing), please
 
 ## Privacy
 
-The recovery scripts post diagnostic telemetry events (with the OpenWork desktop's configuration files attached, **token values redacted client-side**) to a Nexforce-operated diagnostics endpoint to support investigations into reported user issues. No persistent identifiers are involved — every run is keyed by an opaque per-execution `runId`. The installer scripts emit no telemetry of their own.
+Some of the scripts post diagnostic telemetry events (with the OpenWork desktop's configuration files attached, **token values redacted client-side**) to a Nexforce-operated diagnostics endpoint to support investigations into reported user issues. No persistent identifiers are involved — every run is keyed by an opaque per-execution `runId`. Other scripts in this repository emit no telemetry at all.
 
 See [PRIVACY.md](./PRIVACY.md) for the full disclosure, including what's collected, what's explicitly **not** collected, retention, and how to exercise GDPR/CCPA rights.
 
