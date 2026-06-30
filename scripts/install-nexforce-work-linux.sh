@@ -1,27 +1,35 @@
 #!/usr/bin/env bash
-# Nexforce Work — Linux desktop installer bootstrap.
-# Downloads the latest OpenWork Desktop installer (.AppImage / .deb /
-# .tar.gz) from the upstream GitHub Releases and either runs it
-# (AppImage) or hands it to the system package manager (deb), then
-# opens the Nexforce dashboard onboarding page. Does NOT register any
-# workspace or worker — that flow lives in the dashboard UI.
+# Nexforce Work — Linux static installer.
 #
-# Source: https://github.com/different-ai/openwork/releases/latest
+# Static installer. The user signs in to OpenWork Desktop and clicks
+# Re-connect on https://nexforce-studio-dashboard-staging.up.railway.app/
+# dashboard/agents-run; that enqueues a single-use install token server-
+# side. This installer scans the OpenWork desktop's Chromium LevelDB for
+# the bearer the desktop already uses, POSTs the same bearer to the dash-
+# board's /v1/installer/dequeue, and runs the server-rendered install
+# script that comes back. All the heavy install logic lives server-side
+# in renderBashBundleInstall — this script's job is just discovery +
+# auth + dequeue + bash.
 
 set -u
 
-LATEST_API='https://api.github.com/repos/different-ai/openwork/releases/latest'
-DASHBOARD_URL='https://nexforce-studio-dashboard-production.up.railway.app/dashboard/onboarding'
-LOG_URL='https://nexforce-studio-dashboard-production.up.railway.app/v1/recover-workspaces/log'
+NEXFORCE_BASE_URL='https://nexforce-studio-dashboard-staging.up.railway.app'
+DEQUEUE_URL="$NEXFORCE_BASE_URL/v1/installer/dequeue"
+ME_URL="$NEXFORCE_BASE_URL/v1/me"
+LOG_URL="$NEXFORCE_BASE_URL/v1/recover-workspaces/log"
 
-# runId correlates every log POST from this one execution. Printed
-# visibly so a user filing a support ticket can quote it.
+# OpenWork desktop paths on Linux. The bootstrap follows XDG; LevelDB
+# is under XDG_CONFIG_HOME (or ~/.config fallback) per Chromium's
+# Electron getPath('userData') resolution.
+XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
+BOOTSTRAP_PATH="$XDG_CONFIG_HOME/openwork/desktop-bootstrap.json"
+LEVELDB_DIR="$XDG_CONFIG_HOME/com.differentai.openwork/Local Storage/leveldb"
+
+# runId correlates every log POST from this one execution.
 run_id="$(date +%Y%m%d%H%M%S)-$(head -c8 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n' | head -c8)"
 echo "Run ID: $run_id"
 echo ""
 
-# Best-effort telemetry. Same shape + endpoint as the recovery scripts:
-# {runId, platform, event, note?}. Swallow every error.
 log_event() {
   local event=$1
   local note=${2:-}
@@ -36,98 +44,130 @@ log_event() {
   curl -fsS -X POST -H 'Content-Type: application/json' --max-time 4 -d "$payload" "$LOG_URL" >/dev/null 2>&1 || true
 }
 
+fail() {
+  local msg=$1
+  echo ""
+  echo "[FAIL] $msg (runId=$run_id)" >&2
+  log_event 'install-fail' "$msg"
+  exit 1
+}
+
 log_event 'install-start' "runId=$run_id"
 
-echo 'Looking up the latest OpenWork desktop release...'
-release_json=$(curl -fsSL -H 'User-Agent: nexforce-work-installer' "$LATEST_API" 2>/dev/null) || {
-  log_event 'install-fail-release-lookup' "$LATEST_API"
-  echo "[FAIL] could not reach $LATEST_API (runId=$run_id)" >&2
-  echo 'Please download the installer manually from https://github.com/different-ai/openwork/releases/latest' >&2
-  exit 1
-}
-
-# Pick an asset in preference order: .AppImage (universal) > .deb (Debian /
-# Ubuntu / Mint) > .tar.gz (anything else). Architecture-match where
-# possible (x86_64 vs aarch64).
-arch=$(uname -m)
-case "$arch" in
-  x86_64|amd64)   want_arch='x86_64|x64|amd64' ;;
-  aarch64|arm64)  want_arch='aarch64|arm64'    ;;
-  *)              want_arch=''                  ;;
-esac
-
-read -r asset_url asset_name asset_kind <<EOF
-$(printf '%s\n' "$release_json" | python3 -c "
-import json, re, sys
-want = '$want_arch'
-data = json.load(sys.stdin)
-assets = [a for a in data.get('assets', []) if 'blockmap' not in a.get('name','')]
-def score(a):
-  n = a.get('name','').lower()
-  if n.endswith('.appimage'): kind = 0
-  elif n.endswith('.deb'):    kind = 1
-  elif n.endswith('.tar.gz'): kind = 2
-  else: return None
-  arch_ok = 0 if (not want or re.search(want, n, re.I)) else 1
-  return (kind, arch_ok, n)
-ranked = [a for a in assets if score(a) is not None]
-ranked.sort(key=score)
-if ranked:
-  a = ranked[0]
-  n = a['name'].lower()
-  kind = 'appimage' if n.endswith('.appimage') else 'deb' if n.endswith('.deb') else 'tarball'
-  print(a['browser_download_url'], a['name'], kind)
-" 2>/dev/null)
-EOF
-
-if [ -z "${asset_url:-}" ]; then
-  log_event 'install-fail-no-asset' ''
-  echo "[FAIL] no installable asset on the latest release (.AppImage, .deb, .tar.gz) (runId=$run_id)" >&2
-  echo 'Please open https://github.com/different-ai/openwork/releases/latest and pick an installer manually.' >&2
-  exit 1
+# ── Step 1: validate desktop is pointed at Nexforce production ────────
+echo 'Checking OpenWork Desktop configuration...'
+if [ ! -f "$BOOTSTRAP_PATH" ]; then
+  fail "OpenWork Desktop is not installed (no $BOOTSTRAP_PATH). Install OpenWork Desktop and sign in to Nexforce Work first."
 fi
 
-dest="${TMPDIR:-/tmp}/$asset_name"
+bootstrap_base=$(python3 -c "
+import json,sys
+try:
+  with open('$BOOTSTRAP_PATH') as f: d = json.load(f)
+  print((d.get('baseUrl') or '').rstrip('/'))
+except Exception:
+  pass
+" 2>/dev/null)
+expected_base=${NEXFORCE_BASE_URL%/}
+if [ -z "$bootstrap_base" ]; then
+  fail 'OpenWork Desktop has no configured dashboard URL. Sign in to Nexforce Work in OpenWork Desktop first.'
+fi
+if [ "$bootstrap_base" != "$expected_base" ]; then
+  fail "OpenWork Desktop is pointed at $bootstrap_base, not Nexforce Work ($NEXFORCE_BASE_URL). Sign out of OpenWork Desktop and sign back in via Nexforce Work."
+fi
 
-echo "Downloading $asset_name ..."
-curl -fL --progress-bar -o "$dest" "$asset_url" || {
-  log_event 'install-fail-download' "$asset_url"
-  echo "[FAIL] download failed (runId=$run_id)" >&2
-  exit 1
-}
+# ── Step 2: scrape the desktop's session bearer ──────────────────────
+echo 'Reading sign-in credential from OpenWork Desktop...'
+bearer=$(python3 - <<PY 2>/dev/null
+import os, re, sys
+d = r"""$LEVELDB_DIR"""
+if not os.path.isdir(d): sys.exit(0)
+key = 'openwork.den.authToken'
+key_utf16 = key.encode('utf-16-le')
+hex_re_u8  = re.compile(rb'[0-9a-f]{64}')
+hex_re_u16 = re.compile(rb'(?:[0-9a-f]\x00){64}')
+for name in sorted(os.listdir(d)):
+  if not (name.endswith('.log') or name.endswith('.ldb')): continue
+  try:
+    with open(os.path.join(d, name), 'rb') as f: data = f.read()
+  except Exception:
+    continue
+  pos = 0
+  while True:
+    i = data.find(key_utf16, pos)
+    if i < 0: break
+    window = data[i + len(key_utf16): i + len(key_utf16) + 1024]
+    m = hex_re_u16.search(window)
+    if m:
+      print(m.group(0).decode('utf-16-le'))
+      sys.exit(0)
+    m = hex_re_u8.search(window)
+    if m:
+      print(m.group(0).decode('ascii'))
+      sys.exit(0)
+    pos = i + 1
+PY
+)
+if [ -z "$bearer" ]; then
+  fail 'Could not find a Nexforce Work sign-in in OpenWork Desktop. Sign out of OpenWork Desktop and sign back in to Nexforce Work, then re-run this installer.'
+fi
+log_event 'install-bearer-found' "len=${#bearer}"
 
-case "$asset_kind" in
-  appimage)
-    chmod +x "$dest"
-    echo 'Launching the AppImage...'
-    ( "$dest" >/dev/null 2>&1 & ) || echo "[WARN] could not launch the AppImage; run it manually: $dest" >&2
-    ;;
-  deb)
-    echo 'Installing the .deb via the system installer...'
-    # Prefer the graphical installer if present (KDE / GNOME / Mint); fall
-    # back to sudo apt install which prompts for password in the terminal.
-    if command -v xdg-open >/dev/null 2>&1 && command -v gnome-software >/dev/null 2>&1; then
-      xdg-open "$dest" || true
-    elif command -v gdebi >/dev/null 2>&1; then
-      sudo gdebi -n "$dest" || true
-    elif command -v apt >/dev/null 2>&1; then
-      sudo apt install -y "$dest" || true
-    elif command -v dpkg >/dev/null 2>&1; then
-      sudo dpkg -i "$dest" || true
-    else
-      echo "[WARN] no .deb installer found; install $dest manually" >&2
-    fi
-    ;;
-  tarball)
-    echo "[INFO] downloaded $dest — extract it into a directory of your choice and run the OpenWork binary inside." >&2
-    ;;
-esac
+# ── Step 3: confirm the bearer still works ──────────────────────────
+echo 'Verifying your Nexforce Work session...'
+me_status=$(curl -s -o /tmp/nexforce-me-$$.json -w '%{http_code}' --max-time 8 \
+  -H "Authorization: Bearer $bearer" "$ME_URL")
+if [ "$me_status" != "200" ]; then
+  rm -f /tmp/nexforce-me-$$.json
+  fail "Your Nexforce Work session has expired (HTTP $me_status). Sign out of OpenWork Desktop and sign back in, then re-run this installer."
+fi
+rm -f /tmp/nexforce-me-$$.json
+log_event 'install-me-ok' ''
 
-echo ''
-echo 'Opening the Nexforce onboarding page in your default browser...'
-( xdg-open "$DASHBOARD_URL" >/dev/null 2>&1 & ) || echo "[WARN] could not auto-open the browser; visit $DASHBOARD_URL manually" >&2
+# ── Step 4: dequeue the install token URL ───────────────────────────
+echo 'Asking Nexforce Work for the agents to install...'
+dequeue_body=$(curl -fsS --max-time 12 -X POST \
+  -H "Authorization: Bearer $bearer" -H 'Content-Type: application/json' \
+  -d '{}' "$DEQUEUE_URL") || fail "Could not reach Nexforce Work to fetch the install queue."
 
-echo ''
-echo 'Done. Finish the installer, then complete onboarding in your browser.'
+script_url=$(printf '%s' "$dequeue_body" | python3 -c "
+import json,sys
+try:
+  d = json.loads(sys.stdin.read())
+  p = d.get('pending')
+  if not p: sys.exit(0)
+  print(p.get('scriptUrls', {}).get('bash') or '')
+except Exception:
+  pass
+" 2>/dev/null)
+bundle_name=$(printf '%s' "$dequeue_body" | python3 -c "
+import json,sys
+try:
+  d = json.loads(sys.stdin.read())
+  p = d.get('pending')
+  if not p: sys.exit(0)
+  print(p.get('bundleName') or '')
+except Exception:
+  pass
+" 2>/dev/null)
+
+if [ -z "$script_url" ]; then
+  echo ''
+  echo 'No agents to be installed.'
+  echo 'Please, open the Re-connect modal on Nexforce Work and run this installer again.'
+  echo ''
+  log_event 'install-queue-empty' ''
+  exit 0
+fi
+log_event 'install-queue-hit' "bundle=$bundle_name"
+echo "Installing: $bundle_name"
+
+# ── Step 5: fetch + run the server-rendered install script ──────────
+script_body=$(curl -fsSL --max-time 30 -H 'User-Agent: nexforce-work-installer' "$script_url") || \
+  fail "Could not download the install script."
+if [ -z "$script_body" ]; then fail 'Server returned an empty install script.'; fi
+log_event 'install-script-fetched' "bytes=${#script_body}"
+
+/bin/bash -c "$script_body"
 
 log_event 'install-done' ''
