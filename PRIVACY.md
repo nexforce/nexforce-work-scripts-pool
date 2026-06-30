@@ -39,9 +39,9 @@ In the course of receiving the telemetry above, the Nexforce-operated server log
 - We do **not** set persistent identifiers on your machine. The `runId` is generated fresh for every run and discarded once the script exits.
 - We do **not** sell or share telemetry with any third party.
 
-### Scripts that don't emit telemetry
+### Other scripts in this repository
 
-Some of the scripts in this repository fetch the OpenWork desktop binary from its upstream public release page, run it locally, and open your default browser to the Nexforce dashboard onboarding page. They emit **no telemetry of their own**. The upstream release host may log the download request per its own privacy policy.
+Some of the scripts fetch the OpenWork desktop binary from its upstream public release page, run it locally, and open your default browser to the Nexforce dashboard onboarding page. These emit the same minimal lifecycle events to the same diagnostics endpoint (a start event, a done event, and a small set of failure events naming which step did not complete). The upstream release host may additionally log the download request per its own privacy policy.
 
 ## How we use this data
 
