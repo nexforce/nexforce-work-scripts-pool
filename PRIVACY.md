@@ -57,7 +57,7 @@ Nexforce Global Corp employees may access the telemetry to deliver diagnostics o
 
 ## Data protection
 
-The protection of your data is paramount to us. The diagnostics endpoint is served over HTTPS. Token values are redacted client-side before transmission as described above. Per-IP rate limits and request-size limits are enforced server-side to bound abuse impact. The endpoint performs no database writes — telemetry events are emitted to the host's process log and rotated per the hosting provider's standard log-retention.
+The protection of your data is paramount to us. The diagnostics endpoint is served over HTTPS. Token values are redacted client-side before transmission as described above. Per-IP rate limits and request-size limits are enforced server-side to bound abuse impact.
 
 We comply with the GDPR, CCPA, and other relevant data protection regulations. You have rights to access, rectify, and erase your data, as well as restrict or object to processing, and to data portability. You also have the right to lodge a complaint with a supervisory authority.
 
@@ -65,7 +65,7 @@ To exercise your rights, please contact us at `product@nexforce.co`. Because the
 
 ## Data retention and deletion
 
-Telemetry events are retained for as long as the hosting platform's standard application-log rotation keeps them (typically about a month). After that they are no longer retrievable. There is no persistent database record of an individual run beyond that window.
+Telemetry events are retained only for as long as is necessary to support open and recent investigations (typically about a month). After that they are no longer retrievable.
 
 You can prevent any future telemetry from your machine by **not running the script**, or by inspecting the open-source source and running a fork with the telemetry calls disabled.
 
