@@ -1,33 +1,33 @@
 #!/usr/bin/env bash
 # Nexforce Work — macOS static installer.
 #
-# Static signed installer. The user signs in to OpenWork Desktop and clicks
-# Re-connect on https://nexforce-studio-dashboard-staging.up.railway.app/
-# dashboard/agents-run; that enqueues a single-use install token server-
-# side. This installer scans the OpenWork desktop's Chromium LevelDB for
-# the bearer the desktop already uses, POSTs the same bearer to the dash-
-# board's /v1/installer/dequeue, and runs the server-rendered install
-# script that comes back. All the heavy install logic lives server-side
-# in renderBashBundleInstall — this script's job is just discovery +
-# auth + dequeue + bash.
+# Standalone installer. On every run:
+#   1. Picks a free ephemeral port and starts a loopback HTTP listener
+#      (inline python3) on 127.0.0.1:<port>.
+#   2. Opens the user's default browser at the Nexforce Work sign-in
+#      page with ?installerPort=<port>&installerState=<nonce>.
+#   3. The dashboard signs the user in and redirects the browser back
+#      to http://127.0.0.1:<port>/?code=<grant>&state=<nonce>.
+#   4. The listener captures the grant, exchanges it for a Better Auth
+#      session token, and POSTs /v1/installer/dequeue to claim the
+#      install URL the Re-connect modal enqueued.
+#   5. Bashes the server-rendered install body.
+#
+# Independent from OpenWork Desktop's sign-in state — fresh browser
+# sign-in every run, no LevelDB scraping, no shared credentials.
 
 set -u
 
 NEXFORCE_BASE_URL='https://nexforce-studio-dashboard-staging.up.railway.app'
+SIGNIN_URL_BASE="$NEXFORCE_BASE_URL/"
+EXCHANGE_URL="$NEXFORCE_BASE_URL/v1/auth/desktop-handoff/exchange"
 DEQUEUE_URL="$NEXFORCE_BASE_URL/v1/installer/dequeue"
-ME_URL="$NEXFORCE_BASE_URL/v1/me"
 LOG_URL="$NEXFORCE_BASE_URL/v1/recover-workspaces/log"
 
-# OpenWork desktop paths on macOS.
-BOOTSTRAP_PATH="$HOME/.config/openwork/desktop-bootstrap.json"
-LEVELDB_DIR="$HOME/Library/Application Support/com.differentai.openwork/Local Storage/leveldb"
-
-# runId correlates every log POST from this one execution.
 run_id="$(date +%Y%m%d%H%M%S)-$(head -c8 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n' | head -c8)"
 echo "Run ID: $run_id"
 echo ""
 
-# Best-effort telemetry. Swallow every error.
 log_event() {
   local event=$1
   local note=${2:-}
@@ -52,85 +52,94 @@ fail() {
 
 log_event 'install-start' "runId=$run_id"
 
-# ── Step 1: validate desktop is pointed at Nexforce production ────────
-echo 'Checking OpenWork Desktop configuration...'
-if [ ! -f "$BOOTSTRAP_PATH" ]; then
-  fail "OpenWork Desktop is not installed (no $BOOTSTRAP_PATH). Install OpenWork Desktop and sign in to Nexforce Work first."
-fi
+command -v python3 >/dev/null 2>&1 || fail 'python3 is required to host the sign-in callback listener. Install python3 and retry.'
 
-# Strip trailing slash from baseUrl for comparison.
-bootstrap_base=$(python3 -c "
-import json,sys
-try:
-  with open('$BOOTSTRAP_PATH') as f: d = json.load(f)
-  print((d.get('baseUrl') or '').rstrip('/'))
-except Exception:
-  pass
-" 2>/dev/null)
-expected_base=${NEXFORCE_BASE_URL%/}
-if [ -z "$bootstrap_base" ]; then
-  fail 'OpenWork Desktop has no configured dashboard URL. Sign in to Nexforce Work in OpenWork Desktop first.'
-fi
-if [ "$bootstrap_base" != "$expected_base" ]; then
-  fail "OpenWork Desktop is pointed at $bootstrap_base, not Nexforce Work ($NEXFORCE_BASE_URL). Sign out of OpenWork Desktop and sign back in via Nexforce Work."
-fi
+# ── Step 1: pick free port + nonce ──────────────────────────────────
+port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+state=$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+log_event 'install-loopback-bound' "port=$port"
 
-# ── Step 2: scrape the desktop's session bearer ──────────────────────
-#
-# Chromium localStorage lives in LevelDB. We scan *.log + *.ldb files
-# for the UTF-16LE bytes of `openwork.den.authToken` and look for a
-# 64-char hex string (Better Auth's session token) nearby. When the
-# value sits inside a snappy-compressed .ldb block this scan won't
-# find it; the recovery message is "sign out + back in to OpenWork
-# Desktop".
-echo 'Reading sign-in credential from OpenWork Desktop...'
-bearer=$(python3 - <<PY 2>/dev/null
-import os, re, sys
-d = r"""$LEVELDB_DIR"""
-if not os.path.isdir(d): sys.exit(0)
-key = 'openwork.den.authToken'
-key_utf16 = key.encode('utf-16-le')
-hex_re_u8  = re.compile(rb'[0-9a-f]{64}')
-hex_re_u16 = re.compile(rb'(?:[0-9a-f]\x00){64}')
-for name in sorted(os.listdir(d)):
-  if not (name.endswith('.log') or name.endswith('.ldb')): continue
-  try:
-    with open(os.path.join(d, name), 'rb') as f: data = f.read()
-  except Exception:
-    continue
-  pos = 0
-  while True:
-    i = data.find(key_utf16, pos)
-    if i < 0: break
-    window = data[i + len(key_utf16): i + len(key_utf16) + 1024]
-    m = hex_re_u16.search(window)
-    if m:
-      print(m.group(0).decode('utf-16-le'))
-      sys.exit(0)
-    m = hex_re_u8.search(window)
-    if m:
-      print(m.group(0).decode('ascii'))
-      sys.exit(0)
-    pos = i + 1
+# ── Step 2: start the loopback listener in the background ───────────
+# Write the captured ?code=&state= to a temp file the parent reads.
+result_file=$(mktemp -t nexforce-installer.XXXXXX)
+trap 'rm -f "$result_file"' EXIT
+
+PORT=$port STATE=$state RESULT_FILE=$result_file python3 - <<'PY' >/dev/null 2>&1 &
+import http.server, os, socketserver, urllib.parse, sys
+
+port = int(os.environ['PORT'])
+expected_state = os.environ['STATE']
+result_file = os.environ['RESULT_FILE']
+
+OK_HTML = b"""<!doctype html><html><head><meta charset='utf-8'><title>Nexforce Work</title>
+<style>body{font-family:system-ui;background:#0f172a;color:#e2e8f0;margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh}.box{background:#1e293b;padding:32px 40px;border-radius:12px;border:1px solid #334155;max-width:420px}h1{margin:0 0 8px;font-size:18px}p{margin:0;font-size:14px;color:#94a3b8}</style>
+</head><body><div class='box'><h1>Sign-in complete</h1><p>You can close this tab. The Nexforce Work installer is now finishing on your machine.</p></div></body></html>"""
+
+BAD_HTML = b"""<!doctype html><html><head><meta charset='utf-8'><title>Nexforce Work</title></head>
+<body style='font-family:system-ui;padding:32px'><h1>Sign-in failed</h1><p>The installer received an unexpected response. Close this tab, re-run the installer, and try again.</p></body></html>"""
+
+class H(http.server.BaseHTTPRequestHandler):
+  def do_GET(self):
+    u = urllib.parse.urlparse(self.path)
+    q = urllib.parse.parse_qs(u.query)
+    code = (q.get('code') or [''])[0]
+    state = (q.get('state') or [''])[0]
+    if code and state == expected_state:
+      with open(result_file, 'w') as f: f.write(code)
+      body = OK_HTML
+    else:
+      body = BAD_HTML
+    self.send_response(200)
+    self.send_header('Content-Type', 'text/html; charset=utf-8')
+    self.send_header('Content-Length', str(len(body)))
+    self.end_headers()
+    self.wfile.write(body)
+    # Schedule shutdown so the parent unblocks.
+    import threading
+    threading.Thread(target=self.server.shutdown, daemon=True).start()
+  def log_message(self, *a, **kw): pass
+
+with socketserver.TCPServer(('127.0.0.1', port), H) as srv:
+  srv.serve_forever()
 PY
-)
-if [ -z "$bearer" ]; then
-  fail 'Could not find a Nexforce Work sign-in in OpenWork Desktop. Sign out of OpenWork Desktop and sign back in to Nexforce Work, then re-run this installer.'
-fi
-log_event 'install-bearer-found' "len=${#bearer}"
+listener_pid=$!
 
-# ── Step 3: confirm the bearer still works ──────────────────────────
-echo 'Verifying your Nexforce Work session...'
-me_status=$(curl -s -o /tmp/nexforce-me-$$.json -w '%{http_code}' --max-time 8 \
-  -H "Authorization: Bearer $bearer" "$ME_URL")
-if [ "$me_status" != "200" ]; then
-  rm -f /tmp/nexforce-me-$$.json
-  fail "Your Nexforce Work session has expired (HTTP $me_status). Sign out of OpenWork Desktop and sign back in, then re-run this installer."
-fi
-rm -f /tmp/nexforce-me-$$.json
-log_event 'install-me-ok' ''
+# ── Step 3: open the browser ────────────────────────────────────────
+sign_in_url="${SIGNIN_URL_BASE}?desktopAuth=1&mode=sign-in&installerPort=${port}&installerState=${state}"
+echo 'Opening your browser to sign in to Nexforce Work...'
+echo ''
+echo '  If the browser does not open automatically, paste this URL:'
+echo "  $sign_in_url"
+echo ''
+open "$sign_in_url" >/dev/null 2>&1 || true
 
-# ── Step 4: dequeue the install token URL ───────────────────────────
+# ── Step 4: wait for the listener (5 min timeout) ───────────────────
+echo 'Waiting for sign-in (5 minute timeout)...'
+deadline=$(( $(date +%s) + 300 ))
+while kill -0 $listener_pid 2>/dev/null; do
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    kill -9 $listener_pid 2>/dev/null || true
+    fail 'Sign-in timed out. Re-run this installer and complete the browser flow within 5 minutes.'
+  fi
+  sleep 1
+done
+
+code=$(cat "$result_file" 2>/dev/null || true)
+if [ -z "$code" ]; then
+  fail 'Sign-in did not return a grant. Re-run the installer and try again.'
+fi
+log_event 'install-grant-received' "len=${#code}"
+
+# ── Step 5: exchange grant for a session bearer ────────────────────
+echo 'Exchanging sign-in grant for a session token...'
+exch_body=$(curl -fsS --max-time 12 -X POST \
+  -H 'Content-Type: application/json' \
+  -d "{\"grant\":\"$code\"}" "$EXCHANGE_URL") || fail "Sign-in grant exchange failed."
+bearer=$(printf '%s' "$exch_body" | python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get("token") or "")' 2>/dev/null)
+if [ -z "$bearer" ]; then fail 'Sign-in succeeded but no session token was returned.'; fi
+log_event 'install-bearer-acquired' ''
+
+# ── Step 6: dequeue the install token URL ──────────────────────────
 echo 'Asking Nexforce Work for the agents to install...'
 dequeue_body=$(curl -fsS --max-time 12 -X POST \
   -H "Authorization: Bearer $bearer" -H 'Content-Type: application/json' \
@@ -139,23 +148,17 @@ dequeue_body=$(curl -fsS --max-time 12 -X POST \
 script_url=$(printf '%s' "$dequeue_body" | python3 -c "
 import json,sys
 try:
-  d = json.loads(sys.stdin.read())
-  p = d.get('pending')
+  d=json.loads(sys.stdin.read()); p=d.get('pending')
   if not p: sys.exit(0)
-  print(p.get('scriptUrls', {}).get('bash') or '')
-except Exception:
-  pass
-" 2>/dev/null)
+  print(p.get('scriptUrls',{}).get('bash') or '')
+except Exception: pass" 2>/dev/null)
 bundle_name=$(printf '%s' "$dequeue_body" | python3 -c "
 import json,sys
 try:
-  d = json.loads(sys.stdin.read())
-  p = d.get('pending')
+  d=json.loads(sys.stdin.read()); p=d.get('pending')
   if not p: sys.exit(0)
   print(p.get('bundleName') or '')
-except Exception:
-  pass
-" 2>/dev/null)
+except Exception: pass" 2>/dev/null)
 
 if [ -z "$script_url" ]; then
   echo ''
@@ -168,15 +171,12 @@ fi
 log_event 'install-queue-hit' "bundle=$bundle_name"
 echo "Installing: $bundle_name"
 
-# ── Step 5: fetch + run the server-rendered install script ──────────
+# ── Step 7: fetch + run the server-rendered install script ─────────
 script_body=$(curl -fsSL --max-time 30 -H 'User-Agent: nexforce-work-installer' "$script_url") || \
   fail "Could not download the install script."
 if [ -z "$script_body" ]; then fail 'Server returned an empty install script.'; fi
 log_event 'install-script-fetched' "bytes=${#script_body}"
 
-# /bin/bash -c so set -u / set -e behavior inside the rendered script
-# starts fresh; otherwise our outer set -u would trip on optional vars
-# the rendered script intentionally leaves unset.
 /bin/bash -c "$script_body"
 
 log_event 'install-done' ''

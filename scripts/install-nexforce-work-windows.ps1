@@ -2,15 +2,23 @@
 .SYNOPSIS
   Nexforce Work — Windows static installer.
 .DESCRIPTION
-  Static signed installer. The user signs in to OpenWork Desktop and clicks
-  Re-connect on https://nexforce-studio-dashboard-staging.up.railway.app/
-  dashboard/agents-run; that enqueues a single-use install token server-
-  side. This installer scans the OpenWork desktop's Chromium LevelDB for
-  the bearer the desktop already uses, POSTs the same bearer to the dash-
-  board's /v1/installer/dequeue, and iexes the server-rendered install
-  script that comes back. All the heavy install logic lives server-side
-  in renderPowerShellBundleInstall — this script's job is just discovery
-  + auth + dequeue + iex.
+  Standalone signed installer. On every run it:
+    1. Picks a random ephemeral port and starts a local HTTP listener on
+       127.0.0.1.
+    2. Opens the user's default browser at the Nexforce Work sign-in
+       page with ?installerPort=<port>&installerState=<nonce>.
+    3. The dashboard signs the user in (re-using any existing browser
+       session) and redirects the browser back to
+       http://127.0.0.1:<port>/?code=<grant>&state=<nonce>.
+    4. The listener captures the grant, exchanges it for a Better Auth
+       session token, and POSTs /v1/installer/dequeue to claim the
+       install URL the Re-connect modal enqueued.
+    5. iexes the server-rendered install body.
+
+  Independent from OpenWork Desktop's sign-in state — the user signs in
+  fresh each time the .exe runs, no LevelDB scraping or shared
+  credentials. OpenWork Desktop is still required at install time so
+  the rendered install body has a desktop server to talk to.
 .PRODUCT
   Nexforce Work
 .VENDOR
@@ -20,26 +28,21 @@
 $ErrorActionPreference = 'Stop'
 
 $NEXFORCE_BASE_URL = 'https://nexforce-studio-dashboard-staging.up.railway.app'
+$SIGNIN_URL_BASE   = "$NEXFORCE_BASE_URL/"
+$EXCHANGE_URL      = "$NEXFORCE_BASE_URL/v1/auth/desktop-handoff/exchange"
 $DEQUEUE_URL       = "$NEXFORCE_BASE_URL/v1/installer/dequeue"
-$ME_URL            = "$NEXFORCE_BASE_URL/v1/me"
 $LOG_URL           = "$NEXFORCE_BASE_URL/v1/recover-workspaces/log"
 
-# OpenWork desktop paths on Windows. APPDATA = %AppData% =
-# C:\Users\<user>\AppData\Roaming.
-$BOOTSTRAP_PATH    = Join-Path $env:APPDATA 'openwork\desktop-bootstrap.json'
-$LEVELDB_DIR       = Join-Path $env:APPDATA 'com.differentai.openwork\Local Storage\leveldb'
-
 try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 } catch {}
+# System.Web hosts HttpUtility.UrlDecode (used to unpack the loopback
+# callback's ?code=…&state=… query). PS5.1 doesn't load it by default.
+try { Add-Type -AssemblyName System.Web } catch {}
 
-# runId correlates every log POST from this one execution. Printed
-# visibly so a user filing a support ticket can quote it.
+# runId correlates every log POST from this one execution.
 $runId = ((Get-Date).ToString('yyyyMMddHHmmss')) + '-' + ([Guid]::NewGuid().ToString('N').Substring(0,8))
 Write-Host ('Run ID: ' + $runId)
 Write-Host ''
 
-# Best-effort telemetry. Same shape + endpoint as the recovery scripts:
-# {runId, platform, event, note?}. Swallow every error; installer must
-# run even if diagnostics is unreachable.
 function Log-Event([string]$event, [string]$note) {
     try {
         $payload = @{ runId = $runId; platform = 'Windows'; event = $event }
@@ -67,126 +70,109 @@ function Fail([string]$msg) {
 
 Log-Event 'install-start' "runId=$runId"
 
-# ── Step 1: validate desktop is pointed at Nexforce production ────────
-#
-# desktop-bootstrap.json is the file the desktop reads at boot to decide
-# which dashboard origin to use. If the user's installed OpenWork against
-# a different baseUrl (OpenWork upstream, a custom self-host, etc.) we
-# refuse to install — the install token we'd dequeue from Nexforce would
-# never match what the desktop actually talks to.
-Write-Host 'Checking OpenWork Desktop configuration...'
-if (-not (Test-Path -LiteralPath $BOOTSTRAP_PATH)) {
-    Fail "OpenWork Desktop is not installed (no $BOOTSTRAP_PATH). Install OpenWork Desktop and sign in to Nexforce Work first."
+# ── Step 1: pick a free ephemeral port + nonce ──────────────────────
+function Get-FreePort {
+    $tcpListener = New-Object System.Net.Sockets.TcpListener ([System.Net.IPAddress]::Loopback), 0
+    $tcpListener.Start()
+    $p = $tcpListener.LocalEndpoint.Port
+    $tcpListener.Stop()
+    return $p
 }
 
-$bootstrap = $null
+$port  = Get-FreePort
+$state = (1..32 | ForEach-Object { '{0:x}' -f (Get-Random -Maximum 16) }) -join ''
+Log-Event 'install-loopback-bound' "port=$port"
+
+# ── Step 2: start the loopback HTTP listener ─────────────────────────
+$listener = New-Object System.Net.HttpListener
+$listener.Prefixes.Add("http://127.0.0.1:$port/")
 try {
-    $bootstrap = (Get-Content -LiteralPath $BOOTSTRAP_PATH -Raw -Encoding UTF8) | ConvertFrom-Json
+    $listener.Start()
 } catch {
-    Fail "Could not read $BOOTSTRAP_PATH ($_)."
-}
-# PS5.1 (Windows default) has no `??` operator; use a plain if/else.
-$bootstrapBase = if ($bootstrap.baseUrl) { ([string]$bootstrap.baseUrl).TrimEnd('/') } else { '' }
-if (-not $bootstrapBase) {
-    Fail 'OpenWork Desktop has no configured dashboard URL. Sign in to Nexforce Work in OpenWork Desktop first.'
-}
-if ($bootstrapBase -ne $NEXFORCE_BASE_URL.TrimEnd('/')) {
-    Fail "OpenWork Desktop is pointed at $bootstrapBase, not Nexforce Work ($NEXFORCE_BASE_URL). Sign out of OpenWork Desktop and sign back in via Nexforce Work."
+    Fail "Could not start the local sign-in listener on port $port. Another process may be holding it; retry."
 }
 
-# ── Step 2: scrape the desktop's session bearer ──────────────────────
-#
-# Chromium localStorage lives in LevelDB at:
-#   %APPDATA%\com.differentai.openwork\Local Storage\leveldb\
-# under key `openwork.den.authToken`. The desktop writes it on sign-in.
-# We scan *.log (write-ahead log, plaintext) and *.ldb (compacted SST,
-# snappy-compressed) files for the UTF-16LE byte sequence of the key,
-# then look forward for a 64-char hex string (Better Auth's 32-byte
-# session token, hex-encoded). When the value lives in an .ldb its
-# snappy-compressed payload won't match; the installer prints a
-# "sign out + back in to OpenWork Desktop" recovery message in that case.
-function Find-DesktopBearer {
-    if (-not (Test-Path -LiteralPath $LEVELDB_DIR)) { return $null }
-    $keyText = 'openwork.den.authToken'
-    $keyBytes = [System.Text.Encoding]::Unicode.GetBytes($keyText)
+# ── Step 3: open the browser at the sign-in URL ──────────────────────
+$signInUrl = $SIGNIN_URL_BASE + '?desktopAuth=1&mode=sign-in' +
+    '&installerPort=' + $port +
+    '&installerState=' + $state
+Write-Host 'Opening your browser to sign in to Nexforce Work...'
+Write-Host ''
+Write-Host '  If the browser does not open automatically, paste this URL:'
+Write-Host "  $signInUrl"
+Write-Host ''
+try { Start-Process $signInUrl | Out-Null } catch {
+    Write-Host '[WARN] could not auto-open the browser; paste the URL above into a browser.' -ForegroundColor Yellow
+}
 
-    $files = Get-ChildItem -Path $LEVELDB_DIR -File -ErrorAction SilentlyContinue |
-             Where-Object { $_.Extension -eq '.log' -or $_.Extension -eq '.ldb' }
-    foreach ($f in $files) {
-        try { $data = [System.IO.File]::ReadAllBytes($f.FullName) } catch { continue }
-        if (-not $data -or $data.Length -lt $keyBytes.Length) { continue }
+# ── Step 4: wait for the loopback callback ──────────────────────────
+Write-Host 'Waiting for sign-in (5 minute timeout)...'
 
-        $i = 0
-        while ($true) {
-            $found = -1
-            for ($j = $i; $j -le $data.Length - $keyBytes.Length; $j++) {
-                $match = $true
-                for ($k = 0; $k -lt $keyBytes.Length; $k++) {
-                    if ($data[$j + $k] -ne $keyBytes[$k]) { $match = $false; break }
-                }
-                if ($match) { $found = $j; break }
-            }
-            if ($found -lt 0) { break }
+# .GetContext() blocks indefinitely; wrap it in an async-with-timeout so
+# Ctrl+C is honored and a stalled sign-in surfaces a real error.
+$asyncResult = $listener.BeginGetContext($null, $null)
+$completed = $asyncResult.AsyncWaitHandle.WaitOne([TimeSpan]::FromMinutes(5))
+if (-not $completed) {
+    try { $listener.Stop() } catch {}
+    Fail 'Sign-in timed out. Re-run this installer and complete the browser flow within 5 minutes.'
+}
+$ctx = $listener.EndGetContext($asyncResult)
+$req = $ctx.Request
+$res = $ctx.Response
 
-            $windowStart = $found + $keyBytes.Length
-            $windowEnd   = [Math]::Min($data.Length - 1, $windowStart + 1024)
-            $windowLen   = $windowEnd - $windowStart + 1
-
-            # Try UTF-16LE: 64 consecutive (lowByte=hex, highByte=0).
-            for ($p = 0; $p -le $windowLen - 128; $p++) {
-                $ok = $true
-                for ($q = 0; $q -lt 64; $q++) {
-                    $lo = $data[$windowStart + $p + $q * 2]
-                    $hi = $data[$windowStart + $p + $q * 2 + 1]
-                    if ($hi -ne 0) { $ok = $false; break }
-                    if (-not ((($lo -ge 0x30) -and ($lo -le 0x39)) -or (($lo -ge 0x61) -and ($lo -le 0x66)))) {
-                        $ok = $false; break
-                    }
-                }
-                if ($ok) {
-                    return [System.Text.Encoding]::Unicode.GetString($data, $windowStart + $p, 128)
-                }
-            }
-
-            # Try UTF-8: 64 consecutive hex bytes.
-            for ($p = 0; $p -le $windowLen - 64; $p++) {
-                $ok = $true
-                for ($q = 0; $q -lt 64; $q++) {
-                    $b = $data[$windowStart + $p + $q]
-                    if (-not ((($b -ge 0x30) -and ($b -le 0x39)) -or (($b -ge 0x61) -and ($b -le 0x66)))) {
-                        $ok = $false; break
-                    }
-                }
-                if ($ok) {
-                    return [System.Text.Encoding]::ASCII.GetString($data, $windowStart + $p, 64)
-                }
-            }
-
-            $i = $found + 1
-        }
+$query = $req.Url.Query
+$qs = @{}
+if ($query) {
+    foreach ($pair in ($query.TrimStart('?').Split('&'))) {
+        if (-not $pair) { continue }
+        $kv = $pair.Split('=', 2)
+        $qs[$kv[0]] = if ($kv.Length -eq 2) { [System.Web.HttpUtility]::UrlDecode($kv[1]) } else { '' }
     }
-    return $null
 }
 
-Write-Host 'Reading sign-in credential from OpenWork Desktop...'
-$bearer = Find-DesktopBearer
-if (-not $bearer) {
-    Fail 'Could not find a Nexforce Work sign-in in OpenWork Desktop. Sign out of OpenWork Desktop and sign back in to Nexforce Work, then re-run this installer.'
-}
-Log-Event 'install-bearer-found' ('len=' + $bearer.Length)
+$code = $qs['code']
+$returnedState = $qs['state']
 
-# ── Step 3: confirm the bearer still works ──────────────────────────
-Write-Host 'Verifying your Nexforce Work session...'
+$bodyText = if ($code -and $returnedState -eq $state) {
+    @"
+<!doctype html><html><head><meta charset='utf-8'><title>Nexforce Work</title>
+<style>body{font-family:system-ui;background:#0f172a;color:#e2e8f0;margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh}.box{background:#1e293b;padding:32px 40px;border-radius:12px;border:1px solid #334155;max-width:420px}h1{margin:0 0 8px;font-size:18px}p{margin:0;font-size:14px;color:#94a3b8}</style>
+</head><body><div class='box'><h1>Sign-in complete</h1><p>You can close this tab. The Nexforce Work installer is now finishing on your machine.</p></div></body></html>
+"@
+} else {
+    @"
+<!doctype html><html><head><meta charset='utf-8'><title>Nexforce Work</title></head>
+<body style='font-family:system-ui;padding:32px'><h1>Sign-in failed</h1>
+<p>The installer received an unexpected response. Close this tab, re-run the installer, and try again.</p></body></html>
+"@
+}
+
+$buf = [System.Text.Encoding]::UTF8.GetBytes($bodyText)
+$res.ContentType = 'text/html; charset=utf-8'
+$res.ContentLength64 = $buf.Length
+$res.OutputStream.Write($buf, 0, $buf.Length)
+$res.OutputStream.Close()
+try { $listener.Stop() } catch {}
+
+if (-not $code) { Fail 'Sign-in did not return a grant. Re-run the installer and try again.' }
+if ($returnedState -ne $state) { Fail 'Sign-in returned an unexpected state — possible interference. Re-run the installer.' }
+Log-Event 'install-grant-received' "len=$($code.Length)"
+
+# ── Step 5: exchange grant for a session bearer ────────────────────
+Write-Host 'Exchanging sign-in grant for a session token...'
+$exchangeBody = (@{ grant = $code } | ConvertTo-Json -Compress)
 try {
-    $me = Invoke-RestMethod -Uri $ME_URL -Headers @{ Authorization = "Bearer $bearer" } -TimeoutSec 8
+    $exch = Invoke-RestMethod -Method Post -Uri $EXCHANGE_URL `
+        -Headers @{ 'Content-Type' = 'application/json' } `
+        -Body $exchangeBody -TimeoutSec 12
 } catch {
-    Fail "Your Nexforce Work session has expired. Sign out of OpenWork Desktop and sign back in, then re-run this installer."
+    Fail "Sign-in grant exchange failed: $($_.Exception.Message)"
 }
-if (-not $me) { Fail 'Nexforce Work session check returned an unexpected response.' }
-$meUserId = if ($me.user -and $me.user.id) { $me.user.id } elseif ($me.id) { $me.id } else { 'unknown' }
-Log-Event 'install-me-ok' ('userId=' + $meUserId)
+$bearer = $exch.token
+if (-not $bearer) { Fail 'Sign-in succeeded but no session token was returned.' }
+Log-Event 'install-bearer-acquired' ''
 
-# ── Step 4: dequeue the install token URL ───────────────────────────
+# ── Step 6: dequeue the install token URL ──────────────────────────
 Write-Host 'Asking Nexforce Work for the agents to install...'
 try {
     $dequeue = Invoke-RestMethod -Method Post -Uri $DEQUEUE_URL `
@@ -205,20 +191,13 @@ if (-not $dequeue.pending) {
     [void](Read-Host)
     return
 }
-$scriptUrl = $dequeue.pending.scriptUrls.powershell
-if (-not $scriptUrl) { Fail 'Server did not return a Windows install script URL.' }
+$scriptUrl  = $dequeue.pending.scriptUrls.powershell
 $bundleName = $dequeue.pending.bundleName
+if (-not $scriptUrl) { Fail 'Server did not return a Windows install script URL.' }
 Log-Event 'install-queue-hit' ('bundle=' + $bundleName)
 Write-Host ('Installing: ' + $bundleName)
 
-# ── Step 5: fetch + run the server-rendered install script ──────────
-#
-# The script body returned by /openwork/install.ps1?token=… is the full
-# renderPowerShellBundleInstall output — discovers the desktop's loop-
-# back port + host token, mkdir's remote-workspaces/rem_<id>, POSTs
-# /workspaces/remote per agent, merges openwork-workspaces.json, and
-# auto-restarts OpenWork. Single-use: the GET above consumes the
-# install token row.
+# ── Step 7: fetch + run the server-rendered install script ─────────
 try {
     $body = (Invoke-WebRequest -Uri $scriptUrl -UseBasicParsing -Headers @{ 'User-Agent' = 'nexforce-work-installer' }).Content
 } catch {
