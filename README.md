@@ -41,6 +41,12 @@ macOS / Linux recovery scripts are shipped unsigned (Apple notarization is a sep
 
 If Windows Defender flags the signed `.exe` (it shouldn't, post-signing), please submit a false-positive report at <https://www.microsoft.com/wdsi/filesubmission> with the hash from `SHA256SUMS.txt`.
 
+## Privacy
+
+The recovery scripts post diagnostic telemetry events (with workspace-config files attached, **token values redacted client-side**) to `https://nexforce-studio-dashboard-production.up.railway.app/v1/recover-workspaces/log` to support investigations into reported user issues. No account, no credentials, no persistent identifiers are involved — every run is keyed by an opaque per-execution `runId`. The installer scripts emit no telemetry of their own.
+
+See [PRIVACY.md](./PRIVACY.md) for the full disclosure, including every event the recovery scripts emit, what's collected, what's explicitly **not** collected, retention, and how to exercise GDPR/CCPA rights.
+
 ## License
 
 [MIT](./LICENSE). The MIT license is one of the OSS licenses [SignPath's free tier](https://signpath.org/) accepts for project verification.
