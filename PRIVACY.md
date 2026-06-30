@@ -8,7 +8,7 @@ Your data privacy is of utmost importance to us. This policy details: the data w
 
 ## What we gather and the reasons behind it
 
-Our fundamental rule is to gather only what is necessary. The scripts in this repository run **on your own machine** and operate only on files inside your own user profile (`%APPDATA%` on Windows, `~/.config` and `~/Library/Application Support` on Linux/macOS). They do **not** require an account, do **not** prompt you for credentials, and do **not** install background services or persistent telemetry agents.
+Our fundamental rule is to gather only what is necessary. The scripts in this repository run **on your own machine** and operate only on files inside your own user profile (`%APPDATA%` on Windows, `~/.config` and `~/Library/Application Support` on Linux/macOS). They do **not** install background services or persistent telemetry agents.
 
 Here is everything that crosses the network when you run these scripts:
 
