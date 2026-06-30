@@ -55,8 +55,6 @@ We do not use this data for marketing, product analytics that don't relate to th
 
 Nexforce Global Corp employees may access the telemetry to deliver diagnostics or assistance to you. When investigating a specific support ticket, we'll only correlate events to your case to the extent necessary, and we'll inform you when we do.
 
-We reserve the right to disclose this data to law enforcement, regulatory bodies, or legal counsel in compliance with any applicable law, regulation, subpoena, court order, legal process, or governmental request. In such circumstances, we will only share data to the extent required and we will notify you unless we are legally prohibited from doing so.
-
 ## Data protection
 
 The protection of your data is paramount to us. The diagnostics endpoint is served over HTTPS. Token values are redacted client-side before transmission as described above. Per-IP rate limits and request-size limits are enforced server-side to bound abuse impact. The endpoint performs no database writes — telemetry events are emitted to the host's process log and rotated per the hosting provider's standard log-retention.
