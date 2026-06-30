@@ -20,6 +20,10 @@ set -u
 run_id="$(date +%Y%m%d%H%M%S)-$(head -c8 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n' | head -c8)"
 log_url='https://nexforce-studio-dashboard-production.up.railway.app/v1/recover-workspaces/log'
 
+# Print the runId visibly so a user filing a support ticket can quote it.
+echo "Run ID: $run_id"
+echo ""
+
 if [ "$(uname -s)" != "Linux" ]; then
   echo "[FAIL] this script is for Linux only - found $(uname -s)" >&2
   exit 2

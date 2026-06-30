@@ -17,17 +17,50 @@
 
 $ErrorActionPreference = 'Stop'
 
-$LATEST_API   = 'https://api.github.com/repos/different-ai/openwork/releases/latest'
+$LATEST_API    = 'https://api.github.com/repos/different-ai/openwork/releases/latest'
 $DASHBOARD_URL = 'https://nexforce-studio-dashboard-production.up.railway.app/dashboard/onboarding'
+$LOG_URL       = 'https://nexforce-studio-dashboard-production.up.railway.app/v1/recover-workspaces/log'
 
 try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 } catch {}
+
+# runId correlates every log POST from this one execution. Printed visibly
+# so a user filing a support ticket can quote it.
+$runId = ((Get-Date).ToString('yyyyMMddHHmmss')) + '-' + ([Guid]::NewGuid().ToString('N').Substring(0,8))
+Write-Host ('Run ID: ' + $runId)
+Write-Host ''
+
+# Best-effort telemetry. Same shape + endpoint as the recovery scripts:
+# {runId, platform, event, note?}. Swallow every error; the installer
+# must run even if the diagnostics endpoint is unreachable.
+function Log([string]$event, [string]$note) {
+    try {
+        $payload = @{ runId = $runId; platform = 'Windows'; event = $event }
+        if ($note) { $payload.note = $note }
+        $json = $payload | ConvertTo-Json -Compress
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+        $req = [System.Net.HttpWebRequest]::Create($LOG_URL)
+        $req.Method = 'POST'
+        $req.ContentType = 'application/json'
+        $req.Timeout = 4000
+        $req.ReadWriteTimeout = 4000
+        $req.ContentLength = $bytes.Length
+        $stream = $req.GetRequestStream()
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Close()
+        $resp = $req.GetResponse()
+        $resp.Close()
+    } catch {}
+}
+
+Log 'install-start' ('runId=' + $runId)
 
 Write-Host 'Looking up the latest OpenWork desktop release...'
 try {
     # GitHub's REST API requires a User-Agent; -UseBasicParsing keeps PS 5.1 happy.
     $release = Invoke-RestMethod -Uri $LATEST_API -UseBasicParsing -Headers @{ 'User-Agent' = 'nexforce-work-installer' }
 } catch {
-    Write-Host ('[FAIL] could not reach ' + $LATEST_API + ' - ' + $_.Exception.Message) -ForegroundColor Red
+    Log 'install-fail-release-lookup' $_.Exception.Message
+    Write-Host ('[FAIL] could not reach ' + $LATEST_API + ' - ' + $_.Exception.Message + ' (runId=' + $runId + ')') -ForegroundColor Red
     Write-Host ''
     Write-Host 'Please download the installer manually from https://github.com/different-ai/openwork/releases/latest'
     return
@@ -39,7 +72,8 @@ $asset = $release.assets | Where-Object {
 } | Select-Object -First 1
 
 if (-not $asset) {
-    Write-Host '[FAIL] no .exe asset on the latest release' -ForegroundColor Red
+    Log 'install-fail-no-asset' ''
+    Write-Host ('[FAIL] no .exe asset on the latest release (runId=' + $runId + ')') -ForegroundColor Red
     Write-Host 'Please open https://github.com/different-ai/openwork/releases/latest and pick an installer manually.'
     return
 }
@@ -49,7 +83,8 @@ Write-Host ('Downloading ' + $asset.name + ' (' + [int]($asset.size / 1024 / 102
 try {
     Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $installer -UseBasicParsing
 } catch {
-    Write-Host ('[FAIL] download failed: ' + $_.Exception.Message) -ForegroundColor Red
+    Log 'install-fail-download' $_.Exception.Message
+    Write-Host ('[FAIL] download failed: ' + $_.Exception.Message + ' (runId=' + $runId + ')') -ForegroundColor Red
     return
 }
 
@@ -70,3 +105,5 @@ try {
 
 Write-Host ''
 Write-Host 'Done. Finish the installer, then complete onboarding in your browser.'
+
+Log 'install-done' ''

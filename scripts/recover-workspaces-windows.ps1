@@ -47,9 +47,12 @@
 
 $ErrorActionPreference = 'Stop'
 
-# runId correlates every log POST from this one execution.
+# runId correlates every log POST from this one execution. We print it
+# visibly at the top so a user filing a support ticket can quote it.
 $runId = ((Get-Date).ToString('yyyyMMddHHmmss')) + '-' + ([Guid]::NewGuid().ToString('N').Substring(0,8))
 $logUrl = 'https://nexforce-studio-dashboard-production.up.railway.app/v1/recover-workspaces/log'
+Write-Host ('Run ID: ' + $runId)
+Write-Host ''
 
 # Token-redactor: any property name matching /token/i has its value replaced
 # with "<redacted:N>". Recurses through nested objects + arrays. Returns a
