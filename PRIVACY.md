@@ -75,7 +75,7 @@ Our services are not directed at persons under 13 years of age. We do not knowin
 
 ## Changes to this Privacy Policy
 
-We reserve the right to amend this Privacy Policy at any time. The current version is always the file at the top of the `main` branch of this repository, and material changes are recorded in the commit history. By continuing to use the scripts after a change becomes effective, you agree to be bound by the revised Privacy Policy.
+We reserve the right to amend this Privacy Policy at any time. The current version is always the one published on this page, and previous versions remain publicly viewable for comparison. By continuing to use the scripts after a change becomes effective, you agree to be bound by the revised Privacy Policy.
 
 ## Contact Information
 
