@@ -348,6 +348,53 @@ try:
             ' nearKeys=' + (','.join(near_keys) if near_keys else 'NONE') +
             ' allWpKeys=' + ('|'.join(wp_keys) if wp_keys else 'EMPTY')
         )
+
+        # Additional diagnostic: probe every candidate port to see who (if
+        # anyone) is listening. openwork-server responds to /health so we can
+        # tell openwork from a random other service that happens to hold the
+        # port. Best-effort with 1s timeouts.
+        import socket
+        def _port_status(p):
+            if not p: return 'no-port'
+            try:
+                with socket.create_connection(('127.0.0.1', int(p)), timeout=1):
+                    pass
+            except (ConnectionRefusedError, OSError):
+                return 'refused'
+            except Exception as ex:
+                return 'sock-error:' + type(ex).__name__
+            # Something is listening. Probe /health to see if it's openwork.
+            try:
+                req = urllib.request.Request('http://127.0.0.1:' + str(p) + '/health')
+                with urllib.request.urlopen(req, timeout=2) as r:
+                    body = (r.read().decode('utf-8', errors='replace') or '')[:80]
+                    return 'ok:status=' + str(r.status) + ':body=' + body.replace('\n', ' ')
+            except urllib.error.HTTPError as ex:
+                return 'http-error:code=' + str(ex.code)
+            except Exception as ex:
+                return 'http-fail:' + type(ex).__name__ + ':' + repr(ex)[:60]
+
+        # Probe every port that could plausibly be the openwork-server: the
+        # wpHit (what the desktop's normalizeWorkspaceKey lookup returns),
+        # the uiPort (what openwork-workspaces.json says), and every OTHER
+        # port in workspacePorts (stale entries — might reveal that Hugo's
+        # openwork-server is bound to one of them, just not the one that
+        # matches the normalized key).
+        probed = set()
+        pairs = []
+        if wp_hit: pairs.append(('wpHit', wp_hit))
+        if ui_port: pairs.append(('uiPort', ui_port))
+        for wpk, wpv in wp_map.items():
+            if wpv and wpv not in probed and (wp_hit is None or wpv != wp_hit) and (ui_port is None or wpv != ui_port):
+                pairs.append(('otherWp:' + wpk, wpv))
+        for label, port in pairs:
+            probed.add(port)
+            status = _port_status(port)
+            log('local-workspace-port-probe',
+                'id=' + (candidate_ids[0] if candidate_ids else '?') +
+                ' label=' + label +
+                ' port=' + str(port) +
+                ' status=' + status)
 except Exception as ex:
     log('local-baseurl-audit-error', repr(ex))
 
