@@ -268,6 +268,84 @@ if len(by_real) == 0:
     # right user-facing summary.
     sys.exit(2)
 
+# ── local-workspace baseUrl / port audit (diagnostic-only) ────────────────
+# Mirror openwork's runtime.mjs:normalizeWorkspaceKey → path.resolve.lower().
+# The desktop keys workspacePorts + openwork-server-tokens by that lowercased
+# absolute path, so a local workspace at "/Users/hugo/Foo" is stored under
+# "/users/hugo/foo". This block logs, per local workspace:
+#   - workspace id + real path (as we resolved it)
+#   - normalized key (what the desktop uses to look up ports/tokens)
+#   - workspacePorts[key] hit (or MISS + which stale keys ARE present)
+#   - UI baseUrl from openwork-workspaces.json + its embedded port
+#   - whether UI baseUrl port matches workspacePorts port
+#   - path existence for the resolved real path
+# Read-only: no on-disk mutation. Purpose is to make port/baseUrl drift
+# show up as a single grep-friendly event in Railway logs so we can
+# diagnose without needing the user's machine.
+try:
+    def _normalize_workspace_key(v):
+        # Match openwork/apps/desktop/electron/runtime.mjs:28-32:
+        # path.resolve(trimmed).replace(/\\/g, '/').toLowerCase()
+        s = str(v or '').strip()
+        if not s: return ''
+        return os.path.realpath(os.path.abspath(s)).replace('\\', '/').lower()
+
+    state_obj_audit = read_json_or_none(server_state_path) or {}
+    wp_map = state_obj_audit.get('workspacePorts') if isinstance(state_obj_audit.get('workspacePorts'), dict) else {}
+    preferred_port = state_obj_audit.get('preferredPort')
+
+    ui_by_id = {}
+    if isinstance(ws_state, dict):
+        for uw in (ws_state.get('workspaces') or []):
+            if not isinstance(uw, dict): continue
+            if uw.get('workspaceType') == 'remote': continue
+            uwid = (uw.get('id') or '').strip()
+            if not uwid: continue
+            ui_by_id[uwid] = (uw.get('baseUrl') or '').strip()
+
+    def _port_of_url(u):
+        try:
+            from urllib.parse import urlparse
+            return urlparse(u).port
+        except Exception:
+            return None
+
+    wp_keys = list(wp_map.keys())
+    for real, e in by_real.items():
+        norm_key = _normalize_workspace_key(real)
+        wp_hit = wp_map.get(norm_key)
+        candidate_ids = [i for i in [e.get('desktop_id'), e.get('server_id')] if i]
+        ui_base = ''
+        for cid in candidate_ids:
+            if cid in ui_by_id:
+                ui_base = ui_by_id[cid]
+                break
+        ui_port = _port_of_url(ui_base) if ui_base else None
+        near_keys = [k for k in wp_keys if k != norm_key and (norm_key in k or k in norm_key)]
+        try:
+            path_exists = os.path.isdir(real)
+            is_symlink = os.path.islink(real)
+        except Exception:
+            path_exists = False
+            is_symlink = False
+        log(
+            'local-baseurl-audit',
+            'id=' + (candidate_ids[0] if candidate_ids else '?') +
+            ' realPath=' + real +
+            ' normKey=' + norm_key +
+            ' wpHit=' + (str(wp_hit) if wp_hit is not None else 'MISS') +
+            ' uiBaseUrl=' + (ui_base or 'EMPTY') +
+            ' uiPort=' + (str(ui_port) if ui_port is not None else 'NONE') +
+            ' portsMatch=' + (str(wp_hit == ui_port) if (wp_hit is not None and ui_port is not None) else 'N/A') +
+            ' pathExists=' + str(path_exists) +
+            ' isSymlink=' + str(is_symlink) +
+            ' preferredPort=' + str(preferred_port) +
+            ' nearKeys=' + (','.join(near_keys) if near_keys else 'NONE') +
+            ' allWpKeys=' + ('|'.join(wp_keys) if wp_keys else 'EMPTY')
+        )
+except Exception as ex:
+    log('local-baseurl-audit-error', repr(ex))
+
 id_map = {}
 for real, e in by_real.items():
     e['correct_id'] = compute_id(real)
