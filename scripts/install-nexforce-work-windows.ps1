@@ -27,7 +27,7 @@
 
 $ErrorActionPreference = 'Stop'
 
-$NEXFORCE_BASE_URL = 'https://nexforce-studio-dashboard-staging.up.railway.app'
+$NEXFORCE_BASE_URL = 'https://nexforce-studio-dashboard-production.up.railway.app'
 $SIGNIN_URL_BASE   = "$NEXFORCE_BASE_URL/"
 $EXCHANGE_URL      = "$NEXFORCE_BASE_URL/v1/auth/desktop-handoff/exchange"
 $DEQUEUE_URL       = "$NEXFORCE_BASE_URL/v1/installer/dequeue"
