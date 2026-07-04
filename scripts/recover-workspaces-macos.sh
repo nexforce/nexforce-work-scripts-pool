@@ -497,6 +497,40 @@ if isinstance(ws_state, dict):
             log('ui-selection-rewrite', sel + ': old=' + ws_state[sel] + ' new=' + new)
             ws_state[sel] = new
             ui_dirty = True
+    # ── empty/dangling selection repair ────────────────────────────────────
+    # selectedId="" (with activeId empty too) is a split-brain boot: the
+    # Electron main process falls back to workspaces[0] and runs a full local
+    # engine boot for it, while the renderer resolves the empty id to the
+    # no-workspace path and calls openworkServerRestart concurrently — the two
+    # flows tear down each other's embedded server and the desktop errors with
+    # "OpenWork server did not finish starting. Please restart OpenWork." on
+    # every launch. Repoint the selection at a real workspace id (prefer the
+    # watched one — what the user was last using) so both processes resolve
+    # the same workspace and only one boot path runs.
+    ui_ids = []
+    for w in ui_ws:
+        if isinstance(w, dict):
+            wid = str(w.get('id') or '').strip()
+            if wid: ui_ids.append(wid)
+    if ui_ids:
+        cur_sel = ''
+        for sel in ('selectedId', 'selectedWorkspaceId', 'activeId'):
+            v = ws_state.get(sel)
+            if isinstance(v, str) and v.strip():
+                cur_sel = v.strip()
+                break
+        if cur_sel not in ui_ids:
+            watched = ''
+            for sel in ('watchedId', 'watchedWorkspaceId'):
+                v = ws_state.get(sel)
+                if isinstance(v, str) and v.strip():
+                    watched = v.strip()
+                    break
+            new_sel = watched if watched in ui_ids else ui_ids[0]
+            log('ui-selection-repair', 'old=' + (cur_sel or 'EMPTY') + ' new=' + new_sel)
+            for sel in ('selectedId', 'selectedWorkspaceId', 'activeId'):
+                ws_state[sel] = new_sel
+            ui_dirty = True
     if ui_dirty:
         ws_state['workspaces'] = ui_ws
         try:

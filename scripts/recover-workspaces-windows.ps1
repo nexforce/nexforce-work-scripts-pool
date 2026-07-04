@@ -950,6 +950,52 @@ try {
                 $uiDirty = $true
             }
         }
+        # ── empty/dangling selection repair ─────────────────────────────────
+        # selectedId="" (with activeId empty too) is a split-brain boot: the
+        # Electron main process falls back to workspaces[0] and runs a full
+        # local engine boot for it, while the renderer resolves the empty id
+        # to the no-workspace path and calls openworkServerRestart
+        # concurrently — the two flows tear down each other's embedded server
+        # and the desktop errors with "OpenWork server did not finish
+        # starting. Please restart OpenWork." on every launch. Repoint the
+        # selection at a real workspace id (prefer the watched one — what the
+        # user was last using) so both processes resolve the same workspace
+        # and only one boot path runs.
+        $uiIds = @()
+        foreach ($w in $uiWorkspaces) {
+            if (-not $w) { continue }
+            $wid = ('' + $w.id).Trim()
+            if ($wid) { $uiIds += $wid }
+        }
+        if ($uiIds.Count -gt 0) {
+            $curSel = ''
+            foreach ($selField in @('selectedId','selectedWorkspaceId','activeId')) {
+                if (-not ($wsState.PSObject.Properties.Name -contains $selField)) { continue }
+                $v = ('' + $wsState.$selField).Trim()
+                if ($v) { $curSel = $v; break }
+            }
+            if (-not ($uiIds -contains $curSel)) {
+                $watched = ''
+                foreach ($selField in @('watchedId','watchedWorkspaceId')) {
+                    if (-not ($wsState.PSObject.Properties.Name -contains $selField)) { continue }
+                    $v = ('' + $wsState.$selField).Trim()
+                    if ($v) { $watched = $v; break }
+                }
+                $newSel = $uiIds[0]
+                if ($uiIds -contains $watched) { $newSel = $watched }
+                $displayOld = 'EMPTY'
+                if ($curSel) { $displayOld = $curSel }
+                Log 'ui-selection-repair' ('old=' + $displayOld + ' new=' + $newSel) $null
+                foreach ($selField in @('selectedId','selectedWorkspaceId','activeId')) {
+                    if ($wsState.PSObject.Properties.Name -contains $selField) {
+                        $wsState.$selField = $newSel
+                    } else {
+                        $wsState | Add-Member -NotePropertyName $selField -NotePropertyValue $newSel
+                    }
+                }
+                $uiDirty = $true
+            }
+        }
         if ($uiDirty) {
             $wsState.workspaces = $uiWorkspaces
             BackupAndWrite $wsStatePath $wsState
